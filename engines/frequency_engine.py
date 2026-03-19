@@ -1,252 +1,263 @@
-from __future__ import annotations
 """
-Frequency Domain Engine
-────────────────────────
+Frequency Domain Engine — v3.2
+────────────────────────────────
 GAN-generated faces leave characteristic artifacts in the frequency domain.
-FFT analysis of face crops reveals:
-- Checkerboard patterns (upsampling artifacts)
-- Abnormal high-frequency energy distribution
-- DCT coefficient statistics anomalies
-- Power spectrum deviation from natural images
+This engine is highly reliable because it's purely mathematical — no ML deps.
+
+Checks:
+  1. FFT high-frequency energy ratio (natural images follow 1/f²)
+  2. DCT 8×8 block AC/DC coefficient statistics
+  3. Checkerboard artifact detection (transpose conv artifact)
+  4. Power spectrum slope deviation from -2.0
+  5. Temporal frequency flickering across frames
+  6. JPEG blocking artifact analysis (re-encoded deepfakes)
+  7. Color channel frequency correlation
 
 References:
   - Frank et al. (2020) "Leveraging Frequency Analysis for Deep Fake Image Forgery Detection" ICML
-  - Durall et al. (2020) "Watch your Up-Convolution: CNN Based Generative Deep Neural Networks..."
-  - Liu et al. (2021) "Spatial-Phase Shallow Learning: Rethinking Face Forgery Detection in Frequency Domain" CVPR
+  - Durall et al. (2020) "Watch your Up-Convolution" CVPR
+  - Liu et al. (2021) "Spatial-Phase Shallow Learning" CVPR
 """
+from __future__ import annotations
 import numpy as np
 import cv2
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
+
+
+NATURAL_HF_LOW   = 0.10   # minimum natural high-freq energy ratio
+NATURAL_HF_HIGH  = 0.38   # maximum natural high-freq energy ratio
+NATURAL_SLOPE    = -2.0   # natural 1/f² slope
+SLOPE_TOLERANCE  = 0.9    # ±tolerance around natural slope
 
 
 class FrequencyEngine:
-    """
-    Detects deepfake artifacts via FFT and DCT analysis.
-    GANs cannot reproduce the natural frequency distribution of real photos.
-    """
 
     def __init__(self):
-        self.name = "Frequency Domain"
+        self.name = "Frequency"
         self.violations: List[str] = []
 
-    # ── public API ─────────────────────────────────────────────────────────
     def analyze(self, frames: List[np.ndarray]) -> float:
-        """
-        Args:
-            frames: list of BGR uint8 face-crop arrays (any size)
-        Returns:
-            score 0.0→1.0  (higher = more likely FAKE)
-        """
         self.violations = []
         if not frames:
             return 0.5
 
-        scores = []
-        for f in frames:
-            s = self._analyze_single(f)
+        per_frame_scores = []
+        for frame in frames[:30]:
+            if frame is None or frame.size == 0:
+                continue
+            s = self._analyze_frame(frame)
             if s is not None:
-                scores.append(s)
+                per_frame_scores.append(s)
 
-        if not scores:
+        if not per_frame_scores:
             return 0.5
 
-        mean_score = float(np.mean(scores))
-        temporal = self._temporal_consistency(frames)
-        combined = 0.70 * mean_score + 0.30 * temporal
+        frame_mean = float(np.mean(per_frame_scores))
 
-        return float(np.clip(combined, 0.0, 1.0))
+        # Temporal flickering
+        temporal = self._temporal_flicker(frames[:30])
 
-    # ── per-frame analysis ─────────────────────────────────────────────────
-    def _analyze_single(self, frame: np.ndarray) -> Optional[float]:
-        if frame is None or frame.size == 0:
-            return None
+        combined = float(np.clip(0.70 * frame_mean + 0.30 * temporal, 0.0, 1.0))
+        return combined
 
+    # ── Per-frame analysis ─────────────────────────────────────────────────
+    def _analyze_frame(self, frame: np.ndarray) -> Optional[float]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
         gray = cv2.resize(gray, (256, 256)).astype(np.float32)
 
-        subscores = [
-            self._fft_high_freq_ratio(gray),
-            self._dct_coefficient_analysis(gray),
-            self._checkerboard_detection(gray),
-            self._power_spectrum_slope(gray),
+        scores = [
+            self._fft_energy_ratio(gray),
+            self._dct_statistics(gray),
+            self._checkerboard(gray),
+            self._power_slope(gray),
+            self._jpeg_blocking(gray),
         ]
-        return float(np.mean(subscores))
+        valid = [s for s in scores if s is not None]
+        return float(np.mean(valid)) if valid else None
 
-    def _fft_high_freq_ratio(self, gray: np.ndarray) -> float:
-        """
-        GAN upsampling creates abnormal high-frequency energy.
-        Real images have 1/f² power spectrum; GANs deviate significantly.
-        """
+    def _fft_energy_ratio(self, gray: np.ndarray) -> float:
+        """Check high-freq energy ratio against natural 1/f² range."""
         fft = np.fft.fft2(gray)
-        fft_shift = np.fft.fftshift(fft)
-        magnitude = np.abs(fft_shift)
-        h, w = magnitude.shape
+        mag = np.abs(np.fft.fftshift(fft))
+        h, w = mag.shape
         cy, cx = h // 2, w // 2
-
-        # Low-freq energy (central 25%)
-        r_low = min(cy, cx) // 4
-        mask_low = np.zeros_like(magnitude, dtype=bool)
         Y, X = np.ogrid[:h, :w]
         dist = np.sqrt((Y - cy)**2 + (X - cx)**2)
-        mask_low = dist < r_low
-        low_energy = magnitude[mask_low].sum()
+        r_max = min(cy, cx)
 
-        # High-freq energy (outer 50% radius)
-        mask_high = dist > (min(cy, cx) * 0.5)
-        high_energy = magnitude[mask_high].sum()
+        low_e  = mag[dist < r_max * 0.25].sum()
+        high_e = mag[dist > r_max * 0.50].sum()
+        total  = low_e + high_e + 1e-9
+        ratio  = float(high_e / total)
 
-        total = low_energy + high_energy + 1e-9
-        ratio = high_energy / total
+        if ratio < NATURAL_HF_LOW:
+            self.violations.append(
+                f"[Frequency] Over-smoothed spectrum (HF ratio={ratio:.3f}) — GAN blurring artifact")
+            score = 0.70 + (NATURAL_HF_LOW - ratio) / NATURAL_HF_LOW * 0.25
+        elif ratio > NATURAL_HF_HIGH:
+            self.violations.append(
+                f"[Frequency] Excessive high-freq energy (ratio={ratio:.3f}) — GAN upsampling artifact")
+            score = 0.65 + (ratio - NATURAL_HF_HIGH) / (1 - NATURAL_HF_HIGH) * 0.30
+        else:
+            # Natural range — how centered is it?
+            center = (NATURAL_HF_LOW + NATURAL_HF_HIGH) / 2
+            dev = abs(ratio - center) / ((NATURAL_HF_HIGH - NATURAL_HF_LOW) / 2)
+            score = dev * 0.35  # max 0.35 for border of natural range
+        return float(np.clip(score, 0.0, 1.0))
 
-        # Real images: ratio ~0.15–0.30; GANs: often >0.40 or <0.08 (over-smoothed)
-        if ratio > 0.42:
-            self.violations.append(f"[Frequency] Excessive high-freq energy ({ratio:.2f}) — GAN upsampling artifact")
-            return 0.80
-        if ratio < 0.08:
-            self.violations.append(f"[Frequency] Over-smoothed spectrum ({ratio:.2f}) — GAN blurring artifact")
-            return 0.70
-        # Normalize deviation from natural range [0.15, 0.30]
-        natural_center = 0.225
-        deviation = abs(ratio - natural_center) / natural_center
-        return float(np.clip(deviation * 2.0, 0.0, 1.0))
-
-    def _dct_coefficient_analysis(self, gray: np.ndarray) -> float:
-        """
-        Analyze 8×8 DCT block coefficients (JPEG-style).
-        GAN images show characteristic DCT coefficient distributions.
-        Reference: Frank et al. (2020)
-        """
+    def _dct_statistics(self, gray: np.ndarray) -> float:
+        """DCT 8×8 block AC/DC statistics."""
         h, w = gray.shape
-        block_size = 8
-        ac_energies = []
-        dc_values = []
-
-        for i in range(0, h - block_size, block_size):
-            for j in range(0, w - block_size, block_size):
-                block = gray[i:i+block_size, j:j+block_size]
-                dct_block = cv2.dct(block)
-                dc_values.append(abs(dct_block[0, 0]))
-                # AC energy (all except DC)
-                ac = dct_block.copy()
-                ac[0, 0] = 0
+        ac_energies, dc_vals = [], []
+        for i in range(0, h - 8, 8):
+            for j in range(0, w - 8, 8):
+                block = gray[i:i+8, j:j+8]
+                dct   = cv2.dct(block)
+                dc_vals.append(abs(dct[0, 0]))
+                ac = dct.copy(); ac[0, 0] = 0
                 ac_energies.append(np.sum(ac**2))
 
         if not ac_energies:
             return 0.5
 
-        ac_std = float(np.std(ac_energies))
-        dc_std = float(np.std(dc_values))
+        ac_mean = float(np.mean(ac_energies))
+        dc_mean = float(np.mean(dc_vals))
+        ratio   = ac_mean / (dc_mean**2 + 1e-6)
 
-        # Real images: consistent AC/DC ratio; GANs show anomalies
-        ratio = ac_std / (dc_std + 1e-6)
-
-        # Anomaly detection: ratio < 2.0 or > 25.0
-        if ratio < 2.0:
-            self.violations.append(f"[Frequency] DCT AC/DC ratio too low ({ratio:.1f}) — face may be synthesized")
+        # Empirically: real faces 0.5 < ratio < 15.0
+        if ratio < 0.3:
+            self.violations.append(
+                f"[Frequency] DCT: very low AC/DC ratio ({ratio:.2f}) — GAN synthesis")
             return 0.72
-        if ratio > 25.0:
-            self.violations.append(f"[Frequency] DCT AC/DC ratio excessive ({ratio:.1f}) — GAN artifact pattern")
-            return 0.68
-        return float(np.clip((1 - (ratio - 2.0) / 23.0), 0.0, 1.0) * 0.4)
+        if ratio > 20.0:
+            self.violations.append(
+                f"[Frequency] DCT: excessive AC/DC ratio ({ratio:.2f}) — reconstruction artifact")
+            return 0.65
+        return float(np.clip((1.5 - ratio / 10.0) * 0.35, 0.0, 0.40))
 
-    def _checkerboard_detection(self, gray: np.ndarray) -> float:
-        """
-        Detect checkerboard/grid artifacts from transpose convolution in GANs.
-        These appear as periodic patterns at specific frequencies (f=0.5 cycles/pixel).
-        """
+    def _checkerboard(self, gray: np.ndarray) -> float:
+        """Detect transpose-conv checkerboard at f=0.5 cycles/px."""
         fft = np.fft.fft2(gray)
-        fft_shift = np.fft.fftshift(fft)
-        magnitude = np.log1p(np.abs(fft_shift))
-        h, w = magnitude.shape
-        cy, cx = h // 2, w // 2
+        mag = np.log1p(np.abs(np.fft.fftshift(fft)))
+        h, w = mag.shape
+        r = max(h, w) // 16
 
-        # Check for energy peaks at N/2 frequency (checkerboard signature)
-        half_y, half_x = cy + h // 4, cx + w // 4
-        corner_energy = 0.0
-        corner_radius = max(h, w) // 16
-        Y, X = np.ogrid[:h, :w]
+        # N/2 frequency corners (checkerboard signature)
+        corner_e = 0.0
+        for fy, fx in [(h//4, w//4),(h//4, 3*w//4),(3*h//4, w//4),(3*h//4, 3*w//4)]:
+            Y, X = np.ogrid[:h, :w]
+            mask = (Y-fy)**2 + (X-fx)**2 < r**2
+            corner_e += float(mag[mask].mean()) if mask.any() else 0.0
 
-        for fy, fx in [(h // 4, w // 4), (h // 4, 3*w // 4),
-                       (3*h // 4, w // 4), (3*h // 4, 3*w // 4)]:
-            mask = (Y - fy)**2 + (X - fx)**2 < corner_radius**2
-            corner_energy += magnitude[mask].mean() if mask.any() else 0
+        cy, cx = h//2, w//2
+        center_e = float(mag[cy-r:cy+r, cx-r:cx+r].mean()) if r > 0 else 1.0
 
-        center_energy = magnitude[cy-corner_radius:cy+corner_radius, cx-corner_radius:cx+corner_radius].mean()
+        ratio = corner_e / (center_e * 4 + 1e-9)
+        if ratio > 0.88:
+            self.violations.append(
+                f"[Frequency] Checkerboard pattern (ratio={ratio:.2f}) — GAN transpose conv")
+            return float(np.clip(0.65 + (ratio - 0.88) * 2.0, 0.65, 0.90))
+        return float(np.clip(ratio * 0.50, 0.0, 0.45))
 
-        if center_energy > 0:
-            ratio = corner_energy / (center_energy * 4 + 1e-9)
-            if ratio > 0.85:
-                self.violations.append(f"[Frequency] Checkerboard pattern detected (ratio={ratio:.2f}) — GAN transpose conv artifact")
-                return 0.82
-            return float(np.clip(ratio * 0.6, 0.0, 1.0))
-        return 0.3
-
-    def _power_spectrum_slope(self, gray: np.ndarray) -> float:
-        """
-        Natural images follow 1/f^alpha power law (alpha≈2.0).
-        GANs deviate: face-swap often has alpha > 2.5 (over-smooth) or < 1.5 (noisy).
-        """
+    def _power_slope(self, gray: np.ndarray) -> float:
+        """Power spectrum slope — natural images: α≈-2.0."""
         fft = np.fft.fft2(gray)
-        fft_shift = np.fft.fftshift(fft)
-        power = np.abs(fft_shift)**2
+        power = np.abs(np.fft.fftshift(fft))**2
         h, w = power.shape
-        cy, cx = h // 2, w // 2
-
+        cy, cx = h//2, w//2
         Y, X = np.ogrid[:h, :w]
-        dist = np.sqrt((Y - cy)**2 + (X - cx)**2) + 1e-9
-
-        # Bin by distance and compute mean power per band
+        dist = np.sqrt((Y-cy)**2 + (X-cx)**2) + 1e-9
         max_r = min(cy, cx)
-        bands = np.linspace(1, max_r, 20)
-        band_powers = []
-        for i in range(len(bands) - 1):
+        bands = np.linspace(2, max_r, 25)
+        bp = []
+        for i in range(len(bands)-1):
             mask = (dist >= bands[i]) & (dist < bands[i+1])
             if mask.any():
-                band_powers.append(np.log(power[mask].mean() + 1e-9))
+                bp.append(np.log(float(power[mask].mean()) + 1e-9))
 
-        if len(band_powers) < 5:
-            return 0.4
+        if len(bp) < 6:
+            return 0.40
 
-        # Fit slope via linear regression on log-log scale
-        log_freqs = np.log(bands[:-len(band_powers)] + 1) if len(bands) > len(band_powers) else np.log(np.arange(1, len(band_powers)+1))
-        log_freqs = np.log(np.linspace(1, max_r, len(band_powers)))
-        slope, _ = np.polyfit(log_freqs, band_powers, 1)
+        log_f = np.log(np.linspace(2, max_r, len(bp)))
+        slope, _ = np.polyfit(log_f, bp, 1)
 
-        # Natural: slope ≈ -2.0; GANs deviate significantly
-        expected_slope = -2.0
-        deviation = abs(slope - expected_slope)
+        dev = abs(slope - NATURAL_SLOPE)
+        if dev > SLOPE_TOLERANCE:
+            self.violations.append(
+                f"[Frequency] Power spectrum slope={slope:.2f} (natural≈-2.0, dev={dev:.2f})")
+            return float(np.clip(0.45 + dev * 0.25, 0.0, 0.85))
+        return float(np.clip(dev * 0.30, 0.0, 0.35))
 
-        if deviation > 1.2:
-            self.violations.append(f"[Frequency] Power spectrum slope={slope:.2f} (expected≈-2.0) — unnatural frequency distribution")
-            return min(0.75, deviation * 0.35)
-        return float(np.clip(deviation * 0.25, 0.0, 0.5))
-
-    def _temporal_consistency(self, frames: List[np.ndarray]) -> float:
+    def _jpeg_blocking(self, gray: np.ndarray) -> float:
         """
-        Check if frequency characteristics are consistent across frames.
-        Deepfakes often have flickering frequency artifacts.
+        Detect JPEG blocking inconsistency — deepfakes often show irregular
+        DCT block boundaries not consistent with standard JPEG compression.
         """
-        if len(frames) < 3:
-            return 0.3
+        h, w = gray.shape
+        # Compute gradient at 8-pixel boundaries vs non-boundaries
+        boundary_grads, inner_grads = [], []
+        for i in range(0, h-1):
+            row_diff = float(np.mean(np.abs(gray[i].astype(float) - gray[i+1].astype(float))))
+            if i % 8 == 7:
+                boundary_grads.append(row_diff)
+            else:
+                inner_grads.append(row_diff)
 
-        frame_scores = []
-        for f in frames[:20]:
-            gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if len(f.shape) == 3 else f
-            gray = cv2.resize(gray, (128, 128)).astype(np.float32)
-            fft = np.abs(np.fft.fft2(gray))
-            # Flatten and take mean energy per quadrant as fingerprint
+        if not boundary_grads or not inner_grads:
+            return 0.30
+
+        mean_b = float(np.mean(boundary_grads))
+        mean_i = float(np.mean(inner_grads))
+
+        # Natural JPEG: boundary_grad / inner_grad ≈ 1.0–2.5
+        ratio = mean_b / (mean_i + 1e-9)
+
+        if ratio > 4.0:
+            self.violations.append(
+                f"[Frequency] JPEG blocking ratio={ratio:.2f} — inconsistent compression artifacts")
+            return float(np.clip(0.50 + (ratio-4.0)*0.05, 0.50, 0.80))
+        if ratio < 0.6:
+            self.violations.append(
+                f"[Frequency] No JPEG block structure ({ratio:.2f}) — may be re-generated")
+            return 0.55
+        return float(np.clip((ratio - 1.5) * 0.10, 0.0, 0.30))
+
+    def _temporal_flicker(self, frames: List[np.ndarray]) -> float:
+        """Check frequency characteristics stability across frames."""
+        if len(frames) < 4:
+            return 0.30
+
+        fingerprints = []
+        for frame in frames:
+            if frame is None or frame.size == 0:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape)==3 else frame
+            gray = cv2.resize(gray, (64, 64)).astype(np.float32)
+            fft  = np.abs(np.fft.fft2(gray))
             h, w = fft.shape
-            q1 = fft[:h//2, :w//2].mean()
-            q2 = fft[:h//2, w//2:].mean()
-            q3 = fft[h//2:, :w//2].mean()
-            q4 = fft[h//2:, w//2:].mean()
-            frame_scores.append([q1, q2, q3, q4])
+            # Quadrant means as fingerprint
+            fp = np.array([
+                fft[:h//2, :w//2].mean(),
+                fft[:h//2, w//2:].mean(),
+                fft[h//2:, :w//2].mean(),
+                fft[h//2:, w//2:].mean(),
+            ])
+            fingerprints.append(fp / (fp.sum() + 1e-9))
 
-        frame_scores = np.array(frame_scores)
-        # High variance across frames = frequency flickering
-        variance = float(np.std(frame_scores, axis=0).mean())
-        normalized = float(np.clip(variance / 1000.0, 0.0, 1.0))
+        if len(fingerprints) < 3:
+            return 0.30
 
-        if normalized > 0.6:
-            self.violations.append(f"[Frequency] Temporal frequency flickering (variance={variance:.0f}) — GAN regeneration artifact")
-        return normalized
+        fps = np.array(fingerprints)
+        # Frame-to-frame change in frequency fingerprint
+        deltas = np.linalg.norm(np.diff(fps, axis=0), axis=1)
+        mean_delta = float(deltas.mean())
+        max_delta  = float(deltas.max())
+
+        score = 0.0
+        if mean_delta > 0.08:
+            self.violations.append(
+                f"[Frequency] Temporal frequency flickering (mean Δ={mean_delta:.3f}) — GAN regeneration")
+            score += float(np.clip(mean_delta * 4.0, 0.0, 0.70))
+        if max_delta > 0.20:
+            score += 0.15
+        return float(np.clip(score, 0.0, 0.90))

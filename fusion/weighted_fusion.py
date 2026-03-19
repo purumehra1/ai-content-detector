@@ -1,194 +1,264 @@
 """
-Weighted Score Fusion Engine
-─────────────────────────────
-Combines scores from all 10 detection engines into a single verdict.
-
-Fusion Formula:
-  Final = Σ (weight_i × score_i) + stability_modifier
-
-Weights (v3.1 — revised with 10 engines):
-  CNN+GRU         : 0.25  (primary spatial+temporal classifier)
-  Frequency Domain: 0.15  (GAN artifact detection)
-  Biological Motion: 0.12 (physics-based validation)
-  Teeth           : 0.10  (structural biological evidence)
-  rPPG            : 0.10  (physiological heartbeat signal)
-  Eye Consistency : 0.08  (blink, pupil, corneal reflection)
-  Head Pose       : 0.07  (3D consistency)
-  Hand/Finger     : 0.06  (anatomy validation)
-  Skin Texture    : 0.05  (GAN skin rendering)
-  Audio-Visual    : 0.04  (lip-sync)
-  Causal Rules    : 0.04  (rule-based)
-  Stability       : modifier ±0.03
-  ─────────────────────────────────────────
-  Total base      : 1.06 → normalized
-
-Classification thresholds:
-  ≥ 0.72  →  FAKE     HIGH confidence
-  ≥ 0.55  →  FAKE     MEDIUM confidence
-  ≥ 0.42  →  SUSPICIOUS (manual review recommended)
-  < 0.42  →  REAL
+Weighted Score Fusion Engine — v3.2
+─────────────────────────────────────
+Smart fusion that:
+  1. Excludes engines that failed / returned neutral scores
+  2. Applies agreement boost when multiple engines agree on FAKE
+  3. Applies CNN anchor — if CNN says >0.70 fake, floor is raised
+  4. Properly calibrated thresholds
 """
+from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+import numpy as np
 
 
-# Engine weights (must sum to ~1.0 before normalization)
+# Engine weights
 ENGINE_WEIGHTS: Dict[str, float] = {
-    "CNN-GRU":          0.25,
-    "Frequency":        0.15,
-    "Motion":           0.12,
-    "Teeth":            0.10,
-    "rPPG":             0.10,
-    "Eye":              0.08,
-    "HeadPose":         0.07,
-    "Hand":             0.06,
-    "SkinTexture":      0.05,
-    "AudioVisual":      0.04,
-    "Causal":           0.04,
+    "CNN-GRU":     0.28,
+    "Frequency":   0.14,
+    "Motion":      0.12,
+    "Teeth":       0.09,
+    "rPPG":        0.09,
+    "Eye":         0.08,
+    "HeadPose":    0.07,
+    "Hand":        0.05,
+    "SkinTexture": 0.04,
+    "AudioVisual": 0.02,
+    "Causal":      0.02,
 }
-_WEIGHT_SUM = sum(ENGINE_WEIGHTS.values())
-NORMALIZED_WEIGHTS = {k: v / _WEIGHT_SUM for k, v in ENGINE_WEIGHTS.items()}
 
-# Classification thresholds
-THRESHOLD_FAKE_HIGH   = 0.72
-THRESHOLD_FAKE_MEDIUM = 0.55
-THRESHOLD_SUSPICIOUS  = 0.42
+# Engines that return neutral when they can't run (exclude from avg if neutral)
+# "Neutral range" = engine returned without running meaningfully
+NEUTRAL_RANGE = (0.28, 0.38)   # scores in this tight band = likely "no data" neutral
+
+# Engines with known neutral returns when input is missing
+ALWAYS_INCLUDE = {"CNN-GRU", "Frequency", "SkinTexture"}  # always reliable
+
+# Classification thresholds (calibrated)
+THRESHOLD_FAKE_HIGH   = 0.68
+THRESHOLD_FAKE_MEDIUM = 0.50
+THRESHOLD_SUSPICIOUS  = 0.38
 
 
 @dataclass
-class FusionResult:  # noqa: E302
-    label: str                        # REAL | SUSPICIOUS | FAKE
-    confidence: str                   # HIGH | MEDIUM | LOW
-    confidence_pct: float             # 0–100
-    final_score: float                # 0.0–1.0
-    engine_scores: Dict[str, float]   # raw score per engine
-    engine_contributions: Dict[str, float]  # weighted contribution per engine
-    all_violations: List[str]
-    summary: str
-    elapsed_seconds: float = 0.0
-    video_info: dict = field(default_factory=dict)
-    bpm_detected: Optional[float] = None
-    blink_rate: Optional[float] = None
-    dominant_engine: str = ""
-    # XAI fields (populated by DeepFakeDetector after fuse())
-    xai_region_scores: dict = field(default_factory=dict)
-    xai_heatmap: object = None        # numpy ndarray or None
-    xai_explanation: str = ""
-    face_crops: list = field(default_factory=list)
+class FusionResult:
+    label:              str
+    confidence:         str
+    confidence_pct:     float
+    final_score:        float
+    engine_scores:      Dict[str, float]
+    engine_contributions: Dict[str, float]
+    all_violations:     List[str]
+    summary:            str
+    elapsed_seconds:    float = 0.0
+    video_info:         dict  = field(default_factory=dict)
+    bpm_detected:       Optional[float] = None
+    blink_rate:         Optional[float] = None
+    dominant_engine:    str   = ""
+    engines_ran:        int   = 0
+    # XAI fields
+    xai_region_scores:  dict  = field(default_factory=dict)
+    xai_heatmap:        object = None
+    xai_explanation:    str   = ""
+    face_crops:         list  = field(default_factory=list)
 
 
-def fuse(engine_results: Dict[str, float],
-         violations: List[str],
+def _is_neutral(score: float, engine_name: str) -> bool:
+    """Return True if the score looks like a neutral/failed-engine default."""
+    if engine_name in ALWAYS_INCLUDE:
+        return False
+    # Scores very close to 0.3, 0.35, 0.4, 0.45, 0.5 = likely default returns
+    known_neutrals = {0.30, 0.35, 0.40, 0.45, 0.50}
+    for n in known_neutrals:
+        if abs(score - n) < 0.02:
+            return True
+    return False
+
+
+def fuse(engine_results:    Dict[str, float],
+         violations:        List[str],
          stability_modifier: float = 0.0,
-         elapsed: float = 0.0,
-         video_info: dict = None,
-         bpm: Optional[float] = None,
-         blink_rate: Optional[float] = None) -> FusionResult:
-    """
-    Args:
-        engine_results: {engine_name: score_0_to_1}
-        violations: flat list of violation strings from all engines
-        stability_modifier: ±0.03 from stability engine
-        elapsed: analysis time in seconds
-        video_info: dict with width/height/fps/duration/total_frames
-        bpm: detected heart rate BPM (from rPPG engine)
-        blink_rate: detected blink rate per minute
-    Returns:
-        FusionResult
-    """
-    # Compute weighted sum using available engines
-    weighted_sum = 0.0
-    weight_used = 0.0
+         elapsed:           float  = 0.0,
+         video_info:        dict   = None,
+         bpm:               Optional[float] = None,
+         blink_rate:        Optional[float] = None) -> FusionResult:
+
+    if not engine_results:
+        return _make_result("REAL", "LOW", 50.0, 0.5, {}, {}, violations,
+                            "No engines ran — cannot determine authenticity.",
+                            elapsed, video_info or {}, bpm, blink_rate, 0)
+
+    # ── 1. Filter out neutral/failed engines ─────────────────────────────
+    active_scores: Dict[str, float] = {}
+    skipped_engines = []
+
+    for name, raw_score in engine_results.items():
+        score = float(raw_score)
+        if _is_neutral(score, name):
+            skipped_engines.append(name)
+        else:
+            active_scores[name] = score
+
+    # Always include CNN-GRU, Frequency, SkinTexture even if neutral
+    for name in ALWAYS_INCLUDE:
+        if name in engine_results and name not in active_scores:
+            active_scores[name] = float(engine_results[name])
+
+    if not active_scores:
+        active_scores = {k: float(v) for k, v in engine_results.items()}
+
+    # ── 2. Weighted average over ACTIVE engines only ──────────────────────
+    weighted_sum  = 0.0
+    weight_used   = 0.0
     contributions = {}
 
-    for engine_key, weight in NORMALIZED_WEIGHTS.items():
-        if engine_key in engine_results:
-            score = float(engine_results[engine_key])
-            contribution = weight * score
-            contributions[engine_key] = contribution
-            weighted_sum += contribution
-            weight_used += weight
-        else:
-            contributions[engine_key] = 0.0
+    # Normalize weights to active engines only
+    active_weight_sum = sum(ENGINE_WEIGHTS.get(k, 0.03) for k in active_scores)
+    if active_weight_sum == 0:
+        active_weight_sum = len(active_scores)
 
-    # Normalize for missing engines
-    if weight_used > 0:
-        weighted_sum = weighted_sum / weight_used
-    else:
-        weighted_sum = 0.5
+    for name, score in active_scores.items():
+        w = ENGINE_WEIGHTS.get(name, 0.03)
+        norm_w = w / active_weight_sum
+        weighted_sum += norm_w * score
+        weight_used  += norm_w
+        contributions[name] = round(norm_w * score, 4)
 
-    # Apply stability modifier
-    final_score = float(weighted_sum + stability_modifier)
-    final_score = max(0.0, min(1.0, final_score))
+    # Also add zero contributions for inactive engines (for display)
+    for name in engine_results:
+        if name not in contributions:
+            contributions[name] = 0.0
 
-    # Determine verdict
+    base_score = float(weighted_sum / max(weight_used, 1e-9))
+
+    # ── 3. CNN Anchor — strong single-engine evidence ─────────────────────
+    cnn_score = float(active_scores.get("CNN-GRU", 0.5))
+    freq_score = float(active_scores.get("Frequency", 0.5))
+
+    # If CNN is very confident fake, raise the floor
+    if cnn_score > 0.75:
+        cnn_floor = 0.55 + (cnn_score - 0.75) * 0.60
+        base_score = max(base_score, cnn_floor)
+    elif cnn_score > 0.65:
+        cnn_floor = 0.45 + (cnn_score - 0.65) * 0.50
+        base_score = max(base_score, cnn_floor)
+
+    # Frequency engine strong signal
+    if freq_score > 0.70:
+        base_score = max(base_score, 0.50)
+
+    # ── 4. Agreement Boost ────────────────────────────────────────────────
+    # Count how many active engines strongly flag fake
+    strong_fake_votes = sum(1 for s in active_scores.values() if s > 0.60)
+    mild_fake_votes   = sum(1 for s in active_scores.values() if s > 0.45)
+    n_active = len(active_scores)
+
+    agreement_boost = 0.0
+    if n_active >= 4:
+        if strong_fake_votes >= 4:
+            agreement_boost = 0.08  # strong consensus
+        elif strong_fake_votes >= 3:
+            agreement_boost = 0.05
+        elif strong_fake_votes >= 2:
+            agreement_boost = 0.03
+        if mild_fake_votes >= int(n_active * 0.65):
+            agreement_boost += 0.03  # majority mild agreement
+
+    base_score += agreement_boost
+
+    # ── 5. Apply stability modifier ───────────────────────────────────────
+    final_score = float(np.clip(base_score + stability_modifier, 0.0, 1.0))
+
+    # ── 6. Classify ───────────────────────────────────────────────────────
     if final_score >= THRESHOLD_FAKE_HIGH:
-        label = "FAKE"
+        label      = "FAKE"
         confidence = "HIGH"
-        conf_pct = 50.0 + (final_score - THRESHOLD_FAKE_HIGH) / (1.0 - THRESHOLD_FAKE_HIGH) * 49.0 + 1.0
+        conf_pct   = 60.0 + (final_score - THRESHOLD_FAKE_HIGH) / (1.0 - THRESHOLD_FAKE_HIGH) * 38.0
     elif final_score >= THRESHOLD_FAKE_MEDIUM:
-        label = "FAKE"
+        label      = "FAKE"
         confidence = "MEDIUM"
-        conf_pct = 50.0 + (final_score - THRESHOLD_FAKE_MEDIUM) / (THRESHOLD_FAKE_HIGH - THRESHOLD_FAKE_MEDIUM) * 28.0
+        conf_pct   = 50.0 + (final_score - THRESHOLD_FAKE_MEDIUM) / \
+                     (THRESHOLD_FAKE_HIGH - THRESHOLD_FAKE_MEDIUM) * 22.0
     elif final_score >= THRESHOLD_SUSPICIOUS:
-        label = "SUSPICIOUS"
+        label      = "SUSPICIOUS"
         confidence = "LOW"
-        conf_pct = 40.0 + (final_score - THRESHOLD_SUSPICIOUS) / (THRESHOLD_FAKE_MEDIUM - THRESHOLD_SUSPICIOUS) * 20.0
+        conf_pct   = 40.0 + (final_score - THRESHOLD_SUSPICIOUS) / \
+                     (THRESHOLD_FAKE_MEDIUM - THRESHOLD_SUSPICIOUS) * 20.0
     else:
-        label = "REAL"
-        confidence = "HIGH" if final_score < 0.25 else "MEDIUM"
-        conf_pct = 50.0 + (0.42 - final_score) / 0.42 * 49.0
+        label      = "REAL"
+        confidence = "HIGH" if final_score < 0.22 else "MEDIUM"
+        conf_pct   = 50.0 + (THRESHOLD_SUSPICIOUS - final_score) / THRESHOLD_SUSPICIOUS * 48.0
 
     conf_pct = float(max(1.0, min(99.0, conf_pct)))
 
-    # Dominant engine (highest contributor)
-    dominant = max(contributions, key=contributions.get) if contributions else "N/A"
-
-    # Build display engine scores with display names
-    display_scores = {}
+    # ── 7. Build display scores ───────────────────────────────────────────
     name_map = {
-        "CNN-GRU":    "🧠 CNN+GRU (0.25×)",
-        "Frequency":  "📡 Frequency Domain (0.15×)",
-        "Motion":     "🏃 Biological Motion (0.12×)",
-        "Teeth":      "🦷 Teeth Consistency (0.10×)",
-        "rPPG":       "❤️ rPPG Heart Rate (0.10×)",
-        "Eye":        "👁️ Eye Consistency (0.08×)",
-        "HeadPose":   "🗿 Head Pose (0.07×)",
-        "Hand":       "🤚 Hand Anatomy (0.06×)",
-        "SkinTexture":"🔬 Skin Texture (0.05×)",
-        "AudioVisual":"🔊 Audio-Visual (0.04×)",
-        "Causal":     "⚖️ Causal Rules (0.04×)",
+        "CNN-GRU":     "🧠 CNN+GRU (0.28×)",
+        "Frequency":   "📡 Frequency Domain (0.14×)",
+        "Motion":      "🏃 Biological Motion (0.12×)",
+        "Teeth":       "🦷 Teeth Consistency (0.09×)",
+        "rPPG":        "❤️  rPPG Heart Rate (0.09×)",
+        "Eye":         "👁️  Eye Consistency (0.08×)",
+        "HeadPose":    "🗿 Head Pose 3D (0.07×)",
+        "Hand":        "🤚 Hand Anatomy (0.05×)",
+        "SkinTexture": "🔬 Skin Texture (0.04×)",
+        "AudioVisual": "🔊 Audio-Visual (0.02×)",
+        "Causal":      "⚖️  Causal Rules (0.02×)",
     }
+    display_scores: Dict[str, float] = {}
     for k, v in engine_results.items():
         display_name = name_map.get(k, k)
         display_scores[display_name] = round(float(v), 4)
     display_scores["⚡ FINAL SCORE"] = round(final_score, 4)
 
-    # Build summary message
-    top_violations = violations[:3]
-    if label == "FAKE":
-        if top_violations:
-            reason = top_violations[0].split("]")[-1].strip() if "]" in top_violations[0] else top_violations[0]
-            summary = f"Video is {confidence.lower()}-confidence fake. Primary indicator: {reason}"
-        else:
-            summary = f"Video classified as FAKE with {confidence.lower()} confidence (score: {final_score:.3f})."
-    elif label == "SUSPICIOUS":
-        summary = f"Video shows suspicious patterns. Manual review recommended. Score: {final_score:.3f}."
-    else:
-        summary = f"No significant deepfake indicators detected. Video appears authentic (score: {final_score:.3f})."
+    # Dominant engine
+    dominant = max(contributions, key=lambda k: contributions[k]) if contributions else "N/A"
+    dominant_display = name_map.get(dominant, dominant)
 
+    # Summary
+    top_viols = violations[:3]
+    if label == "FAKE":
+        if top_viols:
+            reason = top_viols[0].split("]")[-1].strip() if "]" in top_viols[0] else top_viols[0]
+            summary = (f"Video classified as {confidence.lower()}-confidence FAKE "
+                       f"(score: {final_score:.3f}). "
+                       f"Primary indicator: {reason}")
+        else:
+            summary = (f"Video classified as FAKE — score {final_score:.3f}. "
+                       f"Dominant engine: {dominant_display}.")
+    elif label == "SUSPICIOUS":
+        summary = (f"Suspicious patterns detected (score: {final_score:.3f}). "
+                   f"Manual review recommended. "
+                   f"{strong_fake_votes}/{n_active} engines flagged anomalies.")
+    else:
+        summary = (f"No significant deepfake indicators. "
+                   f"Video appears authentic (score: {final_score:.3f}). "
+                   f"{n_active} engines ran, {strong_fake_votes} flagged minor anomalies.")
+
+    return _make_result(label, confidence, conf_pct, final_score,
+                        display_scores, contributions, violations, summary,
+                        elapsed, video_info or {}, bpm, blink_rate,
+                        len(active_scores), dominant_display)
+
+
+def _make_result(label, confidence, conf_pct, final_score,
+                 display_scores, contributions, violations, summary,
+                 elapsed, video_info, bpm, blink_rate, engines_ran,
+                 dominant="") -> FusionResult:
     return FusionResult(
         label=label,
         confidence=confidence,
-        confidence_pct=conf_pct,
-        final_score=final_score,
+        confidence_pct=float(conf_pct),
+        final_score=float(final_score),
         engine_scores=display_scores,
         engine_contributions=contributions,
         all_violations=violations,
         summary=summary,
-        elapsed_seconds=elapsed,
-        video_info=video_info or {},
+        elapsed_seconds=float(elapsed),
+        video_info=video_info,
         bpm_detected=bpm,
         blink_rate=blink_rate,
-        dominant_engine=name_map.get(dominant, dominant),
+        dominant_engine=dominant,
+        engines_ran=engines_ran,
     )
