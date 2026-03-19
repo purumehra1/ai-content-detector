@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Head Pose & 3D Consistency Engine
 ───────────────────────────────────

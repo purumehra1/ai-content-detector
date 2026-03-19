@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Face detection and landmark extraction utilities."""
 import cv2
 import numpy as np

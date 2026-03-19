@@ -1,12 +1,17 @@
 """
-DeepFake Guardian — Core Detection Pipeline
-────────────────────────────────────────────
-Orchestrates 10+ parallel detection engines and fuses results.
+DeepFake Guardian — Core Detection Pipeline v3.1
+──────────────────────────────────────────────────
+Orchestrates 11 parallel detection engines and fuses results.
+All engines follow the same contract:
+  • __init__(self)  — no required arguments
+  • analyze(frames, ...) → float (0.0 = real, 1.0 = fake)
+  • self.violations: List[str]  — populated after analyze()
 """
+from __future__ import annotations
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import numpy as np
 import cv2
 
@@ -33,25 +38,22 @@ class DeepFakeDetector:
 
     Usage:
         detector = DeepFakeDetector(max_frames=60)
-        result = detector.analyze("path/to/video.mp4")
+        result   = detector.analyze("video.mp4")
         print(result.label, result.final_score)
     """
 
-    def __init__(self,
-                 max_frames: int = 60,
-                 verbose: bool = True,
+    def __init__(self, max_frames: int = 60, verbose: bool = True,
                  device: Optional[str] = None):
         self.max_frames = max_frames
         self.verbose    = verbose
-        self.device     = device
 
-        # Instantiate all engines
+        # Instantiate all engines (no required args)
         self.cnn_gru   = CNNGRUEngine(device=device)
         self.motion    = MotionEngine()
         self.teeth     = TeethEngine()
         self.av        = AudioVisualEngine()
         self.hand      = HandEngine()
-        self.stability = StabilityEngine(base_engine=self.cnn_gru)
+        self.stability = StabilityEngine()    # optional base_engine not required
         self.causal    = CausalEngine()
         self.frequency = FrequencyEngine()
         self.rppg      = RPPGEngine()
@@ -59,186 +61,151 @@ class DeepFakeDetector:
         self.head_pose = HeadPoseEngine()
         self.skin      = SkinTextureEngine()
 
+    # ── public API ─────────────────────────────────────────────────────────
     def analyze(self, video_path: str) -> FusionResult:
-        """Full analysis pipeline."""
         t0 = time.time()
         self._log(f"🔍 Analyzing: {video_path}")
 
-        # 1. Extract frames and info
+        # 1. Extract frames and metadata
         video_info = get_video_info(video_path)
-        frames = extract_frames(video_path, max_frames=self.max_frames)
-        self._log(f"📹 {len(frames)} frames extracted ({video_info.get('width')}×{video_info.get('height')}, {video_info.get('fps', 0):.1f}fps)")
+        frames     = extract_frames(video_path, max_frames=self.max_frames)
+        self._log(f"📹 {len(frames)} frames | "
+                  f"{video_info.get('width')}×{video_info.get('height')} | "
+                  f"{video_info.get('fps', 0):.1f} fps")
 
-        # 2. Extract face crops
+        if not frames:
+            self._log("⚠️  No frames extracted — returning neutral result")
+            return fuse({}, [], elapsed=time.time()-t0, video_info=video_info)
+
+        # 2. Face crops (fallback to full frame if no face detected)
         face_crops = crop_faces(frames)
-        self._log(f"👤 Face crops ready ({len(face_crops)} frames with faces)")
+        self._log(f"👤 Face crops: {len([f for f in face_crops if f is not None])}/{len(frames)}")
 
-        # 3. Extract audio
+        # 3. Audio
         audio_array, sample_rate = extract_audio_array(video_path)
-        self._log(f"🔊 Audio: {len(audio_array) if audio_array is not None else 0} samples @ {sample_rate}Hz")
+        has_audio = audio_array is not None and len(audio_array) > 0
+        self._log(f"🔊 Audio: {'OK' if has_audio else 'not found'}")
 
-        # 4. Run all engines in parallel
-        engine_scores = {}
-        all_violations = []
-        stability_modifier = 0.0
+        # 4. Run engines in parallel
+        engine_scores  : dict  = {}
+        all_violations : List[str] = []
+        stability_mod  : float = 0.0
 
-        def run_engine(name, fn):
+        def _safe_run(name: str, fn) -> Tuple[str, float, List[str]]:
             try:
-                return name, fn()
-            except Exception as e:
+                score, viols = fn()
+                return name, float(score), viols
+            except Exception as exc:
                 if self.verbose:
                     traceback.print_exc()
-                return name, (0.5, [], 0.0)  # default on failure
+                return name, 0.5, [f"[{name}] Engine error: {exc}"]
 
         tasks = {
-            "CNN-GRU":    lambda: self._run_cnn(face_crops or frames),
-            "Frequency":  lambda: self._run_frequency(face_crops or frames),
-            "Motion":     lambda: self._run_motion(frames),
-            "Teeth":      lambda: self._run_teeth(face_crops or frames),
-            "rPPG":       lambda: self._run_rppg(face_crops or frames),
-            "Eye":        lambda: self._run_eye(face_crops or frames),
-            "HeadPose":   lambda: self._run_head_pose(frames),
-            "Hand":       lambda: self._run_hand(frames),
-            "SkinTexture":lambda: self._run_skin(face_crops or frames),
-            "AudioVisual":lambda: self._run_av(frames, audio_array, sample_rate),
-            "Causal":     lambda: self._run_causal(frames),
+            "CNN-GRU":    lambda: (self.cnn_gru.analyze(face_crops or frames),
+                                   self.cnn_gru.violations),
+            "Frequency":  lambda: (self.frequency.analyze(face_crops or frames),
+                                   self.frequency.violations),
+            "Motion":     lambda: (self.motion.analyze(frames),
+                                   self.motion.violations),
+            "Teeth":      lambda: (self.teeth.analyze(face_crops or frames),
+                                   self.teeth.violations),
+            "rPPG":       lambda: (self.rppg.analyze(face_crops or frames),
+                                   self.rppg.violations),
+            "Eye":        lambda: (self.eye.analyze(face_crops or frames),
+                                   self.eye.violations),
+            "HeadPose":   lambda: (self.head_pose.analyze(frames),
+                                   self.head_pose.violations),
+            "Hand":       lambda: (self.hand.analyze(frames),
+                                   self.hand.violations),
+            "SkinTexture":lambda: (self.skin.analyze(face_crops or frames),
+                                   self.skin.violations),
+            "AudioVisual":lambda: (self.av.analyze(frames, audio_array, sample_rate),
+                                   self.av.violations),
+            "Causal":     lambda: (self.causal.analyze(frames),
+                                   self.causal.violations),
         }
 
         with ThreadPoolExecutor(max_workers=6) as pool:
-            futures = {pool.submit(run_engine, name, fn): name for name, fn in tasks.items()}
+            futures = {pool.submit(_safe_run, name, fn): name
+                       for name, fn in tasks.items()}
             for future in as_completed(futures):
-                name, result = future.result()
-                score, viols = result[0], result[1]
-                engine_scores[name] = float(score)
+                name, score, viols = future.result()
+                engine_scores[name] = score
                 all_violations.extend(viols)
-                self._log(f"  ✓ {name}: {score:.4f} ({len(viols)} violations)")
+                self._log(f"  ✓ {name:<14}: {score:.4f}  ({len(viols)} violations)")
 
-        # 5. Stability engine (sequential, needs base engine)
+        # 5. Stability engine (sequential — lightweight)
         try:
-            stab_result = self._run_stability(face_crops or frames)
-            stability_modifier = stab_result[2] if len(stab_result) > 2 else 0.0
-            all_violations.extend(stab_result[1])
-            self._log(f"  ✓ Stability modifier: {stability_modifier:+.4f}")
-        except Exception as e:
-            self._log(f"  ⚠ Stability engine failed: {e}")
+            stab_score, stab_viols, stability_mod = self.stability.analyze(
+                face_crops or frames
+            )
+            all_violations.extend(stab_viols)
+            self._log(f"  ✓ Stability:      modifier {stability_mod:+.4f}")
+        except Exception as exc:
+            if self.verbose:
+                traceback.print_exc()
+            self._log(f"  ⚠ Stability engine error: {exc}")
 
-        # 6. Fuse results
-        bpm       = getattr(self.rppg, '_bpm', None)
-        blink_rate = getattr(self.eye, 'blink_rate_per_min', None)
-
+        # 6. Fuse
         result = fuse(
             engine_scores,
             all_violations,
-            stability_modifier=stability_modifier,
+            stability_modifier=stability_mod,
             elapsed=time.time() - t0,
             video_info=video_info,
-            bpm=bpm,
-            blink_rate=blink_rate,
+            bpm=getattr(self.rppg, '_bpm', None),
+            blink_rate=getattr(self.eye, 'blink_rate_per_min', None),
         )
-        self._log(f"⚡ VERDICT: {result.label} ({result.final_score:.4f}) in {result.elapsed_seconds:.1f}s")
+        self._log(f"\n⚡ VERDICT: {result.label} | Score: {result.final_score:.4f} "
+                  f"| {result.confidence} ({result.confidence_pct:.0f}%) "
+                  f"| {result.elapsed_seconds:.1f}s")
         return result
 
-    # ── engine runners (return score, violations[, modifier]) ─────────────
-    def _run_cnn(self, frames):
-        score = self.cnn_gru.analyze(frames)
-        return score, self.cnn_gru.violations
-
-    def _run_frequency(self, frames):
-        score = self.frequency.analyze(frames)
-        return score, self.frequency.violations
-
-    def _run_motion(self, frames):
-        score = self.motion.analyze(frames)
-        return score, self.motion.violations
-
-    def _run_teeth(self, frames):
-        score = self.teeth.analyze(frames)
-        return score, self.teeth.violations
-
-    def _run_rppg(self, frames):
-        score = self.rppg.analyze(frames)
-        return score, self.rppg.violations
-
-    def _run_eye(self, frames):
-        score = self.eye.analyze(frames)
-        return score, self.eye.violations
-
-    def _run_head_pose(self, frames):
-        score = self.head_pose.analyze(frames)
-        return score, self.head_pose.violations
-
-    def _run_hand(self, frames):
-        score = self.hand.analyze(frames)
-        return score, self.hand.violations
-
-    def _run_skin(self, frames):
-        score = self.skin.analyze(frames)
-        return score, self.skin.violations
-
-    def _run_av(self, frames, audio, sr):
-        score = self.av.analyze(frames, audio, sr)
-        return score, self.av.violations
-
-    def _run_causal(self, frames):
-        score = self.causal.analyze(frames)
-        return score, self.causal.violations
-
-    def _run_stability(self, frames):
-        score, viols, modifier = self.stability.analyze(frames)
-        return score, viols, modifier
-
-    def _log(self, msg):
+    def _log(self, msg: str):
         if self.verbose:
             print(msg)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-    import json
+    import sys, json
     if len(sys.argv) < 2:
         print("Usage: python deepfake_detector.py <video_path> [max_frames]")
         sys.exit(1)
 
-    path = sys.argv[1]
+    path  = sys.argv[1]
     max_f = int(sys.argv[2]) if len(sys.argv) > 2 else 60
+
     detector = DeepFakeDetector(max_frames=max_f, verbose=True)
-    result = detector.analyze(path)
+    result   = detector.analyze(path)
 
     print("\n" + "="*60)
-    print(f"  VERDICT  : {result.label}")
-    print(f"  SCORE    : {result.final_score:.4f}")
+    print(f"  VERDICT   : {result.label}")
+    print(f"  SCORE     : {result.final_score:.4f}")
     print(f"  CONFIDENCE: {result.confidence} ({result.confidence_pct:.0f}%)")
-    print(f"  SUMMARY  : {result.summary}")
+    print(f"  SUMMARY   : {result.summary}")
+    if result.bpm_detected:
+        print(f"  BPM       : {result.bpm_detected:.0f}")
+    if result.blink_rate:
+        print(f"  BLINK RATE: {result.blink_rate:.1f}/min")
     print("="*60)
     print("ENGINE SCORES:")
     for k, v in result.engine_scores.items():
-        print(f"  {k:<40} {v:.4f}")
+        print(f"  {k:<45} {v:.4f}")
     if result.all_violations:
-        print("\nVIOLATIONS:")
+        print(f"\nVIOLATIONS ({len(result.all_violations)}):")
         for v in result.all_violations:
             print(f"  ⚠ {v}")
-    if result.bpm_detected:
-        print(f"\n  Detected BPM: {result.bpm_detected:.0f}")
-    if result.blink_rate:
-        print(f"  Blink rate: {result.blink_rate:.1f}/min")
     print("="*60)
 
-    # Export report
-    report = {
-        "verdict": result.label,
-        "confidence": result.confidence,
-        "confidence_pct": result.confidence_pct,
-        "final_score": result.final_score,
-        "engine_scores": result.engine_scores,
-        "violations": result.all_violations,
-        "summary": result.summary,
-        "bpm": result.bpm_detected,
-        "blink_rate": result.blink_rate,
-        "elapsed_s": result.elapsed_seconds,
-        "video_info": result.video_info,
-    }
-    out_path = path.rsplit(".", 1)[0] + "_report.json"
-    with open(out_path, "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"\nReport saved: {out_path}")
+    out = path.rsplit(".", 1)[0] + "_report.json"
+    with open(out, "w") as f:
+        json.dump({
+            "verdict": result.label, "score": result.final_score,
+            "confidence": result.confidence, "confidence_pct": result.confidence_pct,
+            "engine_scores": result.engine_scores, "violations": result.all_violations,
+            "summary": result.summary, "bpm": result.bpm_detected,
+            "blink_rate": result.blink_rate, "elapsed_s": result.elapsed_seconds,
+            "video_info": result.video_info,
+        }, f, indent=2)
+    print(f"Report saved: {out}")

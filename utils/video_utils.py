@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Video utility functions — frame extraction, audio separation."""
 import cv2
 import numpy as np
