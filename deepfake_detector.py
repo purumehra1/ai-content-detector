@@ -1,183 +1,244 @@
 """
-DeepFake Guardian — Main Detection Pipeline
+DeepFake Guardian — Core Detection Pipeline
 ────────────────────────────────────────────
-Orchestrates all 7 detection engines in parallel using ThreadPoolExecutor
-and fuses their outputs into a final classification.
-
-Usage:
-    detector = DeepFakeDetector()
-    result = detector.analyze(video_path)
-    print(result.label, result.confidence_pct)
+Orchestrates 10+ parallel detection engines and fuses results.
 """
-import os
 import time
-import numpy as np
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional
+import numpy as np
+import cv2
 
-from utils.video_utils import extract_all_frames, extract_audio, get_video_info
-from engines.cnn_gru_engine import CNNGRUEngine
-from engines.motion_engine import MotionEngine
-from engines.teeth_engine import TeethEngine
+from engines.cnn_gru_engine      import CNNGRUEngine
+from engines.motion_engine       import MotionEngine
+from engines.teeth_engine        import TeethEngine
 from engines.audio_visual_engine import AudioVisualEngine
-from engines.hand_engine import HandEngine
-from engines.stability_engine import StabilityEngine
-from engines.causal_engine import CausalEngine
-from fusion.weighted_fusion import fuse, FusionResult
+from engines.hand_engine         import HandEngine
+from engines.stability_engine    import StabilityEngine
+from engines.causal_engine       import CausalEngine
+from engines.frequency_engine    import FrequencyEngine
+from engines.rppg_engine         import RPPGEngine
+from engines.eye_engine          import EyeEngine
+from engines.head_pose_engine    import HeadPoseEngine
+from engines.skin_texture_engine import SkinTextureEngine
+from fusion.weighted_fusion      import fuse, FusionResult
+from utils.video_utils           import extract_frames, extract_audio_array, get_video_info
+from utils.face_utils            import crop_faces
 
 
 class DeepFakeDetector:
     """
-    Unified hybrid deepfake detection pipeline.
-    All engines run in parallel; results fused via weighted scoring.
+    Main deepfake detection pipeline.
+
+    Usage:
+        detector = DeepFakeDetector(max_frames=60)
+        result = detector.analyze("path/to/video.mp4")
+        print(result.label, result.final_score)
     """
 
-    def __init__(self, max_frames: int = 60, verbose: bool = True):
+    def __init__(self,
+                 max_frames: int = 60,
+                 verbose: bool = True,
+                 device: Optional[str] = None):
         self.max_frames = max_frames
-        self.verbose = verbose
+        self.verbose    = verbose
+        self.device     = device
 
-        # Lazy-init engines (loaded on first use)
-        self._cnn_gru    = CNNGRUEngine()
-        self._motion     = MotionEngine()
-        self._teeth      = TeethEngine()
-        self._av         = AudioVisualEngine()
-        self._hand       = HandEngine()
-        self._stability  = StabilityEngine()
-        self._causal     = CausalEngine()
-
-    def _log(self, msg: str):
-        if self.verbose:
-            print(f"[DeepFakeGuardian] {msg}")
+        # Instantiate all engines
+        self.cnn_gru   = CNNGRUEngine(device=device)
+        self.motion    = MotionEngine()
+        self.teeth     = TeethEngine()
+        self.av        = AudioVisualEngine()
+        self.hand      = HandEngine()
+        self.stability = StabilityEngine(base_engine=self.cnn_gru)
+        self.causal    = CausalEngine()
+        self.frequency = FrequencyEngine()
+        self.rppg      = RPPGEngine()
+        self.eye       = EyeEngine()
+        self.head_pose = HeadPoseEngine()
+        self.skin      = SkinTextureEngine()
 
     def analyze(self, video_path: str) -> FusionResult:
-        if not os.path.isfile(video_path):
-            raise FileNotFoundError(f"Video not found: {video_path}")
+        """Full analysis pipeline."""
+        t0 = time.time()
+        self._log(f"🔍 Analyzing: {video_path}")
 
-        t_start = time.perf_counter()
-        self._log(f"Starting analysis: {os.path.basename(video_path)}")
+        # 1. Extract frames and info
+        video_info = get_video_info(video_path)
+        frames = extract_frames(video_path, max_frames=self.max_frames)
+        self._log(f"📹 {len(frames)} frames extracted ({video_info.get('width')}×{video_info.get('height')}, {video_info.get('fps', 0):.1f}fps)")
 
-        # ── Step 1: Extract frames and audio ──────────────────────────────────
-        info = get_video_info(video_path)
-        self._log(f"Video: {info['width']}×{info['height']} @ {info['fps']:.1f}fps, {info['duration']:.1f}s, {info['total_frames']} frames")
+        # 2. Extract face crops
+        face_crops = crop_faces(frames)
+        self._log(f"👤 Face crops ready ({len(face_crops)} frames with faces)")
 
-        frames, fps = extract_all_frames(video_path, max_frames=self.max_frames)
-        self._log(f"Extracted {len(frames)} frames for analysis")
+        # 3. Extract audio
+        audio_array, sample_rate = extract_audio_array(video_path)
+        self._log(f"🔊 Audio: {len(audio_array) if audio_array is not None else 0} samples @ {sample_rate}Hz")
 
-        audio_path = extract_audio(video_path)
-        self._log(f"Audio: {'extracted to ' + audio_path if audio_path else 'not available'}")
+        # 4. Run all engines in parallel
+        engine_scores = {}
+        all_violations = []
+        stability_modifier = 0.0
 
-        # Extract RMS for causal engine (shared computation)
-        rms_timeline = None
-        if audio_path:
+        def run_engine(name, fn):
             try:
-                import librosa
-                y, sr = librosa.load(audio_path, sr=16000, mono=True)
-                hop_len = int(sr / fps)
-                rms = librosa.feature.rms(y=y, hop_length=hop_len)[0]
-                rms_timeline = np.array(rms[:len(frames)])
-            except Exception:
-                pass
+                return name, fn()
+            except Exception as e:
+                if self.verbose:
+                    traceback.print_exc()
+                return name, (0.5, [], 0.0)  # default on failure
 
-        # ── Step 2: Run all engines in parallel ───────────────────────────────
-        self._log("Running parallel detection engines...")
-        results = {}
+        tasks = {
+            "CNN-GRU":    lambda: self._run_cnn(face_crops or frames),
+            "Frequency":  lambda: self._run_frequency(face_crops or frames),
+            "Motion":     lambda: self._run_motion(frames),
+            "Teeth":      lambda: self._run_teeth(face_crops or frames),
+            "rPPG":       lambda: self._run_rppg(face_crops or frames),
+            "Eye":        lambda: self._run_eye(face_crops or frames),
+            "HeadPose":   lambda: self._run_head_pose(frames),
+            "Hand":       lambda: self._run_hand(frames),
+            "SkinTexture":lambda: self._run_skin(face_crops or frames),
+            "AudioVisual":lambda: self._run_av(frames, audio_array, sample_rate),
+            "Causal":     lambda: self._run_causal(frames),
+        }
 
-        def run_cnn():
-            self._log("  → CNN+GRU engine starting...")
-            r = self._cnn_gru.analyze(frames)
-            self._log(f"  ✓ CNN+GRU: {r['score']:.3f}")
-            return "cnn", r
-
-        def run_motion():
-            self._log("  → Motion engine starting...")
-            r = self._motion.analyze(frames)
-            self._log(f"  ✓ Motion: {r['score']:.3f}")
-            return "motion", r
-
-        def run_teeth():
-            self._log("  → Teeth engine starting...")
-            r = self._teeth.analyze(frames)
-            self._log(f"  ✓ Teeth: {r['score']:.3f}")
-            return "teeth", r
-
-        def run_av():
-            self._log("  → Audio-Visual engine starting...")
-            r = self._av.analyze(frames, audio_path, fps)
-            self._log(f"  ✓ Audio-Visual: {r['score']:.3f}")
-            return "av", r
-
-        def run_hand():
-            self._log("  → Hand engine starting...")
-            r = self._hand.analyze(frames)
-            self._log(f"  ✓ Hand: {r['score']:.3f}")
-            return "hand", r
-
-        def run_stability():
-            self._log("  → Stability engine starting...")
-            r = self._stability.analyze(frames)
-            self._log(f"  ✓ Stability: {r['score']:.3f}")
-            return "stability", r
-
-        def run_causal():
-            self._log("  → Causal engine starting...")
-            r = self._causal.analyze(frames, rms_timeline)
-            self._log(f"  ✓ Causal: {r['score']:.3f}")
-            return "causal", r
-
-        tasks = [run_cnn, run_motion, run_teeth, run_av, run_hand, run_stability, run_causal]
-
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            futures = {ex.submit(fn): fn.__name__ for fn in tasks}
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(run_engine, name, fn): name for name, fn in tasks.items()}
             for future in as_completed(futures):
-                try:
-                    key, result = future.result()
-                    results[key] = result
-                except Exception as e:
-                    name = futures[future]
-                    self._log(f"  ✗ Engine error in {name}: {e}")
-                    results[name.replace("run_", "")] = {"score": 0.5, "violations": [f"Engine error: {e}"]}
+                name, result = future.result()
+                score, viols = result[0], result[1]
+                engine_scores[name] = float(score)
+                all_violations.extend(viols)
+                self._log(f"  ✓ {name}: {score:.4f} ({len(viols)} violations)")
 
-        # ── Step 3: Fuse results ───────────────────────────────────────────────
-        self._log("Fusing engine scores...")
-        fusion_result = fuse(
-            cnn_result=results.get("cnn", {"score": 0.5, "violations": []}),
-            motion_result=results.get("motion", {"score": 0.5, "violations": []}),
-            teeth_result=results.get("teeth", {"score": 0.5, "violations": []}),
-            hand_result=results.get("hand", {"score": 0.3, "violations": []}),
-            av_result=results.get("av", {"score": 0.5, "violations": []}),
-            causal_result=results.get("causal", {"score": 0.5, "violated_rules": []}),
-            stability_result=results.get("stability", {"score": 0.5, "violations": []}),
+        # 5. Stability engine (sequential, needs base engine)
+        try:
+            stab_result = self._run_stability(face_crops or frames)
+            stability_modifier = stab_result[2] if len(stab_result) > 2 else 0.0
+            all_violations.extend(stab_result[1])
+            self._log(f"  ✓ Stability modifier: {stability_modifier:+.4f}")
+        except Exception as e:
+            self._log(f"  ⚠ Stability engine failed: {e}")
+
+        # 6. Fuse results
+        bpm       = getattr(self.rppg, '_bpm', None)
+        blink_rate = getattr(self.eye, 'blink_rate_per_min', None)
+
+        result = fuse(
+            engine_scores,
+            all_violations,
+            stability_modifier=stability_modifier,
+            elapsed=time.time() - t0,
+            video_info=video_info,
+            bpm=bpm,
+            blink_rate=blink_rate,
         )
+        self._log(f"⚡ VERDICT: {result.label} ({result.final_score:.4f}) in {result.elapsed_seconds:.1f}s")
+        return result
 
-        elapsed = time.perf_counter() - t_start
-        self._log(f"Analysis complete in {elapsed:.1f}s → {fusion_result.label} ({fusion_result.confidence_pct:.0f}% confidence)")
+    # ── engine runners (return score, violations[, modifier]) ─────────────
+    def _run_cnn(self, frames):
+        score = self.cnn_gru.analyze(frames)
+        return score, self.cnn_gru.violations
 
-        # Clean up temp audio
-        if audio_path and os.path.isfile(audio_path):
-            os.unlink(audio_path)
+    def _run_frequency(self, frames):
+        score = self.frequency.analyze(frames)
+        return score, self.frequency.violations
 
-        # Attach raw engine results for debugging
-        fusion_result.__dict__["_engine_results"] = results
-        fusion_result.__dict__["elapsed_seconds"] = round(elapsed, 2)
-        fusion_result.__dict__["video_info"] = info
+    def _run_motion(self, frames):
+        score = self.motion.analyze(frames)
+        return score, self.motion.violations
 
-        return fusion_result
+    def _run_teeth(self, frames):
+        score = self.teeth.analyze(frames)
+        return score, self.teeth.violations
+
+    def _run_rppg(self, frames):
+        score = self.rppg.analyze(frames)
+        return score, self.rppg.violations
+
+    def _run_eye(self, frames):
+        score = self.eye.analyze(frames)
+        return score, self.eye.violations
+
+    def _run_head_pose(self, frames):
+        score = self.head_pose.analyze(frames)
+        return score, self.head_pose.violations
+
+    def _run_hand(self, frames):
+        score = self.hand.analyze(frames)
+        return score, self.hand.violations
+
+    def _run_skin(self, frames):
+        score = self.skin.analyze(frames)
+        return score, self.skin.violations
+
+    def _run_av(self, frames, audio, sr):
+        score = self.av.analyze(frames, audio, sr)
+        return score, self.av.violations
+
+    def _run_causal(self, frames):
+        score = self.causal.analyze(frames)
+        return score, self.causal.violations
+
+    def _run_stability(self, frames):
+        score, viols, modifier = self.stability.analyze(frames)
+        return score, viols, modifier
+
+    def _log(self, msg):
+        if self.verbose:
+            print(msg)
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
+    import json
     if len(sys.argv) < 2:
-        print("Usage: python deepfake_detector.py <video_path>")
+        print("Usage: python deepfake_detector.py <video_path> [max_frames]")
         sys.exit(1)
-    detector = DeepFakeDetector()
-    result = detector.analyze(sys.argv[1])
-    print(f"\n{'='*50}")
-    print(f"VERDICT: {result.label} ({result.confidence} confidence, {result.confidence_pct:.0f}%)")
-    print(f"Final Score: {result.final_score:.4f}")
-    print(f"\nEngine Breakdown:")
+
+    path = sys.argv[1]
+    max_f = int(sys.argv[2]) if len(sys.argv) > 2 else 60
+    detector = DeepFakeDetector(max_frames=max_f, verbose=True)
+    result = detector.analyze(path)
+
+    print("\n" + "="*60)
+    print(f"  VERDICT  : {result.label}")
+    print(f"  SCORE    : {result.final_score:.4f}")
+    print(f"  CONFIDENCE: {result.confidence} ({result.confidence_pct:.0f}%)")
+    print(f"  SUMMARY  : {result.summary}")
+    print("="*60)
+    print("ENGINE SCORES:")
     for k, v in result.engine_scores.items():
-        print(f"  {k}: {v}")
-    print(f"\nViolations ({len(result.all_violations)}):")
-    for v in result.all_violations:
-        print(f"  ⚠ {v}")
-    print(f"\nSummary: {result.summary}")
-    print(f"{'='*50}")
+        print(f"  {k:<40} {v:.4f}")
+    if result.all_violations:
+        print("\nVIOLATIONS:")
+        for v in result.all_violations:
+            print(f"  ⚠ {v}")
+    if result.bpm_detected:
+        print(f"\n  Detected BPM: {result.bpm_detected:.0f}")
+    if result.blink_rate:
+        print(f"  Blink rate: {result.blink_rate:.1f}/min")
+    print("="*60)
+
+    # Export report
+    report = {
+        "verdict": result.label,
+        "confidence": result.confidence,
+        "confidence_pct": result.confidence_pct,
+        "final_score": result.final_score,
+        "engine_scores": result.engine_scores,
+        "violations": result.all_violations,
+        "summary": result.summary,
+        "bpm": result.bpm_detected,
+        "blink_rate": result.blink_rate,
+        "elapsed_s": result.elapsed_seconds,
+        "video_info": result.video_info,
+    }
+    out_path = path.rsplit(".", 1)[0] + "_report.json"
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"\nReport saved: {out_path}")

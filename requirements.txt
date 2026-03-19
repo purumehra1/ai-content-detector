@@ -1,12 +1,43 @@
+# ═══════════════════════════════════════════════════
+# DeepFake Guardian v3.1 — Requirements
+# ═══════════════════════════════════════════════════
+
+# ── Web Framework ──────────────────────────────────
 streamlit>=1.32.0
+
+# ── Deep Learning ──────────────────────────────────
 torch>=2.1.0
 torchvision>=0.16.0
-transformers>=4.38.0
+transformers>=4.38.0   # HuggingFace ViT models
+
+# ── Computer Vision ────────────────────────────────
 opencv-python-headless>=4.9.0
-mediapipe>=0.10.9
+mediapipe>=0.10.9      # Face mesh, hand landmarks, face detection
+Pillow>=10.0.0
+
+# ── Audio Processing ───────────────────────────────
 librosa>=0.10.1
+soundfile>=0.12.1
+imageio[ffmpeg]>=2.34.0   # FFmpeg wrapper (Windows-compatible)
+
+# ── Scientific Computing ───────────────────────────
 numpy>=1.24.0
 scipy>=1.11.0
-Pillow>=10.0.0
-soundfile>=0.12.1
-ffmpeg-python>=0.2.0
+
+# ── Visualization ──────────────────────────────────
+plotly>=5.18.0
+matplotlib>=3.7.0
+seaborn>=0.13.0
+
+# ── Machine Learning ───────────────────────────────
+scikit-learn>=1.3.0
+
+# ── Utilities ──────────────────────────────────────
+tqdm>=4.66.0
+requests>=2.31.0
+
+# ── Document Generation ────────────────────────────
+# reportlab>=4.0.0   # Uncomment for PDF export
+
+# ── Optional: NVIDIA GPU acceleration ──────────────
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
