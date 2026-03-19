@@ -1,0 +1,12 @@
+streamlit>=1.32.0
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.38.0
+opencv-python-headless>=4.9.0
+mediapipe>=0.10.9
+librosa>=0.10.1
+numpy>=1.24.0
+scipy>=1.11.0
+Pillow>=10.0.0
+soundfile>=0.12.1
+ffmpeg-python>=0.2.0
