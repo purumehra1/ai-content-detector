@@ -79,3 +79,49 @@ def get_teeth_region(frame: np.ndarray, landmarks: np.ndarray) -> np.ndarray | N
 def get_jaw_center(landmarks: np.ndarray) -> np.ndarray:
     """Return centroid of jaw landmarks."""
     return landmarks[JAW, :2].mean(axis=0)
+
+
+def crop_faces(frames: list, padding: float = 0.20) -> list:
+    """
+    Detect and crop face region from each frame.
+    Falls back to the original frame if no face is detected.
+
+    Args:
+        frames: list of BGR numpy arrays
+        padding: fractional padding around detected face bounding box
+    Returns:
+        list of BGR numpy arrays (face crops or original frames)
+    """
+    if not frames:
+        return []
+
+    crops = []
+    try:
+        with mp_face_detection.FaceDetection(
+            model_selection=1, min_detection_confidence=0.45
+        ) as detector:
+            for frame in frames:
+                if frame is None or frame.size == 0:
+                    crops.append(frame)
+                    continue
+                try:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    result = detector.process(rgb)
+                    if result.detections:
+                        d = result.detections[0].location_data.relative_bounding_box
+                        h, w = frame.shape[:2]
+                        x1 = max(0, int((d.xmin - padding * d.width) * w))
+                        y1 = max(0, int((d.ymin - padding * d.height) * h))
+                        x2 = min(w, int((d.xmin + d.width * (1 + padding)) * w))
+                        y2 = min(h, int((d.ymin + d.height * (1 + padding)) * h))
+                        crop = frame[y1:y2, x1:x2]
+                        crops.append(crop if crop.size > 0 else frame)
+                    else:
+                        crops.append(frame)  # no face detected — use full frame
+                except Exception:
+                    crops.append(frame)
+    except Exception:
+        # MediaPipe unavailable — return original frames
+        return frames
+
+    return crops
