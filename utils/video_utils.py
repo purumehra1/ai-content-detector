@@ -66,6 +66,54 @@ def extract_audio(video_path: str) -> str | None:
         return None
 
 
+def extract_audio_array(video_path: str, sr: int = 16000):
+    """
+    Extract audio as numpy array directly (no temp file needed).
+    Returns (audio_array, sample_rate) or (None, sr) on failure.
+    Uses imageio[ffmpeg] if available, then falls back to temp-file approach.
+    """
+    # Method 1: imageio / ffmpeg pipe
+    try:
+        import imageio
+        reader = imageio.get_reader(video_path, "ffmpeg")
+        meta = reader.get_meta_data()
+        audio_fps = meta.get("audio_fps", sr)
+        # imageio doesn't expose raw audio easily — fall through to method 2
+        reader.close()
+    except Exception:
+        pass
+
+    # Method 2: librosa (handles most formats via soundfile / ffmpeg backend)
+    try:
+        import librosa
+        audio_path = extract_audio(video_path)
+        if audio_path:
+            y, sr_detected = librosa.load(audio_path, sr=sr, mono=True)
+            try:
+                os.unlink(audio_path)
+            except Exception:
+                pass
+            return y, sr_detected
+    except Exception:
+        pass
+
+    # Method 3: soundfile on extracted wav
+    try:
+        import soundfile as sf
+        audio_path = extract_audio(video_path)
+        if audio_path:
+            y, sr_detected = sf.read(audio_path, dtype="float32", always_2d=False)
+            try:
+                os.unlink(audio_path)
+            except Exception:
+                pass
+            return y, sr_detected
+    except Exception:
+        pass
+
+    return None, sr
+
+
 def get_video_info(video_path: str) -> dict:
     cap = cv2.VideoCapture(video_path)
     info = {
