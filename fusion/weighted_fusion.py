@@ -56,7 +56,7 @@ THRESHOLD_SUSPICIOUS  = 0.42
 
 
 @dataclass
-class FusionResult:
+class FusionResult:  # noqa: E302
     label: str                        # REAL | SUSPICIOUS | FAKE
     confidence: str                   # HIGH | MEDIUM | LOW
     confidence_pct: float             # 0–100
@@ -70,6 +70,11 @@ class FusionResult:
     bpm_detected: Optional[float] = None
     blink_rate: Optional[float] = None
     dominant_engine: str = ""
+    # XAI fields (populated by DeepFakeDetector after fuse())
+    xai_region_scores: dict = field(default_factory=dict)
+    xai_heatmap: object = None        # numpy ndarray or None
+    xai_explanation: str = ""
+    face_crops: list = field(default_factory=list)
 
 
 def fuse(engine_results: Dict[str, float],
